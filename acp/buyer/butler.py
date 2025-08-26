@@ -74,11 +74,18 @@ def buyer():
     job_id = acp.initiate_job(
         provider_address=provider,
         service_requirement={
-            "walletAddress": "0x6B00F08F81d81FeC5154B6E807AcD4613cD16795",
-            "prompt": "swap 0.01 VIRTUAL for ETH",
+            # Example: Buy 0.01 ETH worth of VIRTUAL (ETH -> VIRTUAL)
+            "side": "buy",
+            "fromToken": "ETH",  # or zero address
+            "toToken": "0x6B00F08F81d81FeC5154B6E807AcD4613cD16795",  # VIRTUAL token
+            "amount": "0.00001",  # human units of fromToken
+            "slippageBps": int(os.getenv("DEFAULT_SLIPPAGE_BPS", "100")),
+            "recipient": env.BUYER_AGENT_WALLET_ADDRESS,
+            "chain": os.getenv("CHAIN", "base"),
+            "notes": "demo request from buyer",
         },
         # Use a non-dust budget on mainnet USDC (6 decimals). Adjust if your policy expects a minimum.
-        amount=0.1,
+        amount=0.001,
         evaluator_address=env.BUYER_AGENT_WALLET_ADDRESS,
         expired_at=datetime.now() + timedelta(days=1),
     )

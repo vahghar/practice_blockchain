@@ -25,7 +25,9 @@ OPERARI_DATA = os.path.join(OPERARI_ROOT, "data")
 for p in (OPERARI_ROOT, OPERARI_DATA):
     if p not in sys.path:
         sys.path.append(p)
-from crew.crew import CryptoAnalysisCrew
+from acp.common.schemas import TradeRequest
+from data.crew.tools.tokenTools import TokenTransactionTool
+import csv
 
 
 load_dotenv(override=True)
@@ -43,6 +45,68 @@ def _parse_service_requirement(sr):
             return {}
 
 
+# Resolve token address and decimals from symbol or address.
+# Fallbacks:
+# - 'ETH' maps to Base canonical ETH address with 18 decimals
+# - If already an address (0x...), assume 18 decimals unless found in CSV
+_TOKENS_CACHE = None
+_TOKENS_CSV_PATH = os.path.join(OPERARI_ROOT, "tokens.csv")
+
+
+def _load_tokens_csv():
+    global _TOKENS_CACHE
+    if _TOKENS_CACHE is not None:
+        return _TOKENS_CACHE
+    cache = {}
+    try:
+        with open(_TOKENS_CSV_PATH, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            # Expect header like: Token,Full Name,Contract Address,decimals
+            next(reader, None)
+            for row in reader:
+                if len(row) < 4:
+                    continue
+                sym = str(row[0]).strip()
+                addr = str(row[2]).strip()
+                try:
+                    dec = int(str(row[3]).strip())
+                except Exception:
+                    dec = 18
+                if sym:
+                    cache[sym.upper()] = {"address": addr, "decimals": dec}
+    except Exception as e:
+        print(f"[SELLER] Warning: failed to load tokens.csv at {_TOKENS_CSV_PATH}: {e}")
+    _TOKENS_CACHE = cache
+    return _TOKENS_CACHE
+
+
+def _resolve_token(value: str):
+    """
+    Returns tuple (address, decimals).
+    Accepts symbol (e.g., 'USDC', 'ETH') or address (0x...).
+    """
+    if not value:
+        raise ValueError("Token value is empty")
+    v = str(value).strip()
+    # Base canonical ETH (WETH) address used by TokenTransactionTool to skip approvals
+    ETH_ADDR = "0x4200000000000000000000000000000000000006"
+    if v.lower() == "eth":
+        return ETH_ADDR, 18
+    if v.startswith("0x") and len(v) == 42:
+        # Try to enrich decimals from CSV if present by matching address
+        tokens = _load_tokens_csv()
+        for sym, info in tokens.items():
+            if info.get("address", "").lower() == v.lower():
+                return info.get("address"), int(info.get("decimals", 18))
+        return v, 18
+    # Symbol path
+    tokens = _load_tokens_csv()
+    info = tokens.get(v.upper())
+    if not info:
+        raise ValueError(f"Unknown token symbol '{v}'. Please use address or add to tokens.csv")
+    return info.get("address"), int(info.get("decimals", 18))
+
+
 def seller():
     env = EnvSettings()
 
@@ -56,24 +120,75 @@ def seller():
                     job.respond(True)
                     break
         elif job.phase == ACPJobPhase.TRANSACTION:
-            print("[SELLER] TRANSACTION received. Preparing delivery and moving to EVALUATION...")
+            print("[SELLER] TRANSACTION received. Preparing quote/tx bundle and moving to EVALUATION...")
             for memo in job.memos:
                 if memo.next_phase == ACPJobPhase.EVALUATION:
-                    print("Delivering job", job)
-                    requirements = _parse_service_requirement(job.service_requirement)
-                    message = requirements.get("prompt", "")
-                    wallet_address = requirements.get("walletAddress")
-                    result = CryptoAnalysisCrew().crew().kickoff(inputs={
-                        "wallet_address": wallet_address,
-                        "message": message,
-                    })
-                    data = result.pydantic.to_dict() if getattr(result, "pydantic", None) is not None else result.raw
-                    delivery_data = {
-                        "type": "object",
-                        "value": data,
-                    }
-                    print(f"[SELLER] Delivering data (truncated preview): {str(delivery_data)[:200]}...")
-                    job.deliver(json.dumps(delivery_data))
+                    try:
+                        requirements = _parse_service_requirement(job.service_requirement)
+                        tr = TradeRequest.from_dict(requirements)
+                        # Resolve tokens and decimals
+                        sell_addr, sell_dec = _resolve_token(tr.fromToken)
+                        buy_addr, _ = _resolve_token(tr.toToken)
+                        recipient = tr.recipient or env.SELLER_AGENT_WALLET_ADDRESS
+
+                        # Build using Operari internal tool (KyberSwap)
+                        tool = TokenTransactionTool()
+                        tool_resp_raw = tool._run(
+                            buy_token=buy_addr,
+                            sell_token=sell_addr,
+                            sell_amount=str(tr.amount),
+                            wallet_address=recipient,
+                            sell_token_decimals=int(sell_dec),
+                        )
+
+                        # Parse tool response
+                        tool_resp = json.loads(tool_resp_raw) if isinstance(tool_resp_raw, str) else tool_resp_raw
+                        if "error" in tool_resp:
+                            raise RuntimeError(tool_resp.get("error"))
+
+                        tx_section = tool_resp.get("transaction", {})
+                        tx_data = tx_section.get("transactionData") or tx_section.get("transaction") or {}
+                        needs_approval = bool(tx_section.get("needsApproval"))
+                        approval_data = tx_section.get("approvalData") or {}
+
+                        meta = {
+                            "quoteSource": "KyberSwap via TokenTransactionTool",
+                            "sellAmount": tx_section.get("sellAmount"),
+                            "sellToken": tx_section.get("sellToken"),
+                            "buyToken": tx_section.get("buyToken"),
+                            "gasPriceGwei": tx_data.get("gasPriceGwei"),
+                            "totalGas": tx_data.get("totalGas"),
+                            "gasUsd": tx_data.get("gasUsd"),
+                            "needsApproval": needs_approval,
+                        }
+                        summary = f"{tr.side.upper()} {tr.amount} {tr.fromToken} -> {tr.toToken} on {tr.chain}"
+
+                        bundle = {
+                            "transactionData": tx_data,
+                        }
+                        if needs_approval and approval_data:
+                            bundle["approvalData"] = approval_data
+
+                        delivery_data = {
+                            "type": "object",
+                            "value": {
+                                "quote": summary,
+                                "non_custodial_bundle": bundle,
+                                "meta": meta,
+                            },
+                        }
+                        print(f"[SELLER] Delivering non-custodial bundle (preview): {str(delivery_data)[:200]}...")
+                        job.deliver(json.dumps(delivery_data))
+                    except Exception as e:
+                        err_payload = {
+                            "type": "object",
+                            "value": {
+                                "error": "QUOTE_OR_BUILD_FAILED",
+                                "message": str(e),
+                            },
+                        }
+                        print(f"[SELLER] Error building delivery: {e}")
+                        job.deliver(json.dumps(err_payload))
                     break
 
     if env.WHITELISTED_WALLET_PRIVATE_KEY is None:
