@@ -19,6 +19,112 @@ from virtuals_acp.configs import BASE_MAINNET_CONFIG
 
 load_dotenv(override=True)
 
+def execute_swap_transaction(tx_data, private_key, rpc_url):
+    """
+    Execute the actual swap transaction on-chain.
+    
+    Args:
+        tx_data: Transaction data from seller's delivery
+        private_key: Buyer's wallet private key
+        rpc_url: RPC endpoint for the network
+        
+    Returns:
+        bool: True if transaction succeeded, False otherwise
+    """
+    try:
+        # Initialize Web3
+        web3 = Web3(Web3.HTTPProvider(rpc_url))
+        if not web3.is_connected():
+            print("[BUYER] Failed to connect to RPC")
+            return False
+        
+        # Get account from private key
+        account = web3.eth.account.from_key(private_key)
+        wallet_address = account.address
+        
+        # Get current nonce
+        nonce = web3.eth.get_transaction_count(wallet_address)
+        
+        # Prepare transaction
+        transaction = {
+            'to': web3.to_checksum_address(tx_data['to']),
+            'data': tx_data['data'],
+            'value': int(tx_data.get('value', '0')),
+            'gas': int(tx_data.get('totalGas', '200000')),  # fallback gas limit
+            'gasPrice': web3.to_wei(float(tx_data.get('gasPriceGwei', '0.1')), 'gwei'),
+            'nonce': nonce
+        }
+        
+        print(f"[BUYER] Executing swap transaction: {transaction['to']}")
+        print(f"[BUYER] Value: {transaction['value']} wei")
+        print(f"[BUYER] Gas limit: {transaction['gas']}")
+        
+        # Sign transaction
+        signed_txn = web3.eth.account.sign_transaction(transaction, private_key)
+        
+        # Send transaction
+        tx_hash = web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+        print(f"[BUYER] Transaction sent: {tx_hash.hex()}")
+        
+        # Wait for confirmation
+        receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        
+        if receipt.status == 1:
+            print(f"[BUYER] Swap successful! Gas used: {receipt.gasUsed}")
+            return True
+        else:
+            print(f"[BUYER] Swap failed! Transaction reverted")
+            return False
+            
+    except Exception as e:
+        print(f"[BUYER] Swap execution error: {e}")
+        return False
+
+
+def execute_approval_transaction(approval_data, private_key, rpc_url):
+    """
+    Execute token approval transaction if needed.
+    
+    Args:
+        approval_data: Approval transaction data
+        private_key: Buyer's wallet private key
+        rpc_url: RPC endpoint
+        
+    Returns:
+        bool: True if approval succeeded, False otherwise
+    """
+    try:
+        web3 = Web3(Web3.HTTPProvider(rpc_url))
+        account = web3.eth.account.from_key(private_key)
+        
+        nonce = web3.eth.get_transaction_count(account.address)
+        
+        approval_tx = {
+            'to': web3.to_checksum_address(approval_data['to']),
+            'data': approval_data['data'],
+            'value': 0,
+            'gas': int(approval_data.get('gas', '100000')),
+            'gasPrice': web3.to_wei(float(approval_data.get('gasPriceGwei', '0.1')), 'gwei'),
+            'nonce': nonce
+        }
+        
+        print("[BUYER] Executing approval transaction...")
+        signed_txn = web3.eth.account.sign_transaction(approval_tx, private_key)
+        tx_hash = web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+        
+        receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        
+        if receipt.status == 1:
+            print("[BUYER] Approval successful!")
+            return True
+        else:
+            print("[BUYER] Approval failed!")
+            return False
+            
+    except Exception as e:
+        print(f"[BUYER] Approval execution error: {e}")
+        return False
+
 
 def buyer():
     env = EnvSettings()
