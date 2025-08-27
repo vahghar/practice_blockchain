@@ -7,10 +7,10 @@ from ast import literal_eval
 from dotenv import load_dotenv
 
 # Prefer local SDK at ../acp-python over installed site-packages
-_ACPROOT = os.path.dirname(os.path.dirname(__file__))  # .../acp
-_SDK_DIR = os.path.join(os.path.dirname(_ACPROOT), "acp-python")  # sibling to acp
-if _SDK_DIR not in sys.path:
-    sys.path.insert(0, _SDK_DIR)
+#_ACPROOT = os.path.dirname(os.path.dirname(__file__))  # .../acp
+#_SDK_DIR = os.path.join(os.path.dirname(_ACPROOT), "acp-python")  # sibling to acp
+#if _SDK_DIR not in sys.path:
+#    sys.path.insert(0, _SDK_DIR)
 
 from dataclasses import replace
 from virtuals_acp import VirtualsACP, ACPJob, ACPJobPhase
@@ -112,6 +112,7 @@ def seller():
 
     def on_new_task(job: ACPJob, memo_to_sign=None):
         print(f"[SELLER] on_new_task: phase={job.phase} job_id={getattr(job, 'id', None)} memos={len(job.memos)}")
+        
         if job.phase == ACPJobPhase.REQUEST:
             print("[SELLER] REQUEST received. Checking memos for NEGOTIATION transition...")
             for memo in job.memos:
@@ -119,83 +120,118 @@ def seller():
                     print("[SELLER] Accepting request -> moving to NEGOTIATION")
                     job.respond(True)
                     break
+        
         elif job.phase == ACPJobPhase.TRANSACTION:
             print("[SELLER] TRANSACTION received. Preparing quote/tx bundle and moving to EVALUATION...")
             
+            # Find the ORIGINAL memo with trade data (not payment confirmation)
+            original_trade_memo = None
             for memo in job.memos:
-                if memo in job.memos:
-                    if memo.content and memo.content.strip().startswith('{') and 'side' in memo.content:
-                        original_trade_memo = memo
-                            break
-                if memo.next_phase == ACPJobPhase.EVALUATION:
-                    try:
-                        print(f"[DEBUG] Reading from memo.content: {memo.content}")
-                        requirements = _parse_service_requirement(memo.content)
-                        tr = TradeRequest.from_dict(requirements)
-                        # Resolve tokens and decimals
-                        sell_addr, sell_dec = _resolve_token(tr.fromToken)
-                        buy_addr, _ = _resolve_token(tr.toToken)
-                        recipient = tr.recipient or env.SELLER_AGENT_WALLET_ADDRESS
-
-                        # Build using Operari internal tool (KyberSwap)
-                        tool = TokenTransactionTool()
-                        tool_resp_raw = tool._run(
-                            buy_token=buy_addr,
-                            sell_token=sell_addr,
-                            sell_amount=str(tr.amount),
-                            wallet_address=recipient,
-                            sell_token_decimals=int(sell_dec),
-                        )
-
-                        # Parse tool response
-                        tool_resp = json.loads(tool_resp_raw) if isinstance(tool_resp_raw, str) else tool_resp_raw
-                        if "error" in tool_resp:
-                            raise RuntimeError(tool_resp.get("error"))
-
-                        tx_section = tool_resp.get("transaction", {})
-                        tx_data = tx_section.get("transactionData") or tx_section.get("transaction") or {}
-                        needs_approval = bool(tx_section.get("needsApproval"))
-                        approval_data = tx_section.get("approvalData") or {}
-
-                        meta = {
-                            "quoteSource": "KyberSwap via TokenTransactionTool",
-                            "sellAmount": tx_section.get("sellAmount"),
-                            "sellToken": tx_section.get("sellToken"),
-                            "buyToken": tx_section.get("buyToken"),
-                            "gasPriceGwei": tx_data.get("gasPriceGwei"),
-                            "totalGas": tx_data.get("totalGas"),
-                            "gasUsd": tx_data.get("gasUsd"),
-                            "needsApproval": needs_approval,
-                        }
-                        summary = f"{tr.side.upper()} {tr.amount} {tr.fromToken} -> {tr.toToken} on {tr.chain}"
-
-                        bundle = {
-                            "transactionData": tx_data,
-                        }
-                        if needs_approval and approval_data:
-                            bundle["approvalData"] = approval_data
-
-                        delivery_data = {
-                            "type": "object",
-                            "value": {
-                                "quote": summary,
-                                "non_custodial_bundle": bundle,
-                                "meta": meta,
-                            },
-                        }
-                        print(f"[SELLER] Delivering non-custodial bundle (preview): {str(delivery_data)[:200]}...")
-                        job.deliver(delivery_data)
-                    except Exception as e:
-                        err_payload = {
-                            "type": "object",
-                            "value": {
-                                "error": "QUOTE_OR_BUILD_FAILED",
-                                "message": str(e),
-                            },
-                        }
-                        print(f"[SELLER] Error building delivery: {e}")
-                        job.deliver(err_payload)
+                if memo.content and memo.content.strip().startswith('{') and 'side' in memo.content:
+                    original_trade_memo = memo
                     break
+            
+            if not original_trade_memo:
+                print("[SELLER] ERROR: Could not find original trade request memo")
+                err_payload = IDeliverable(
+                    type="object",
+                    value={
+                        "error": "MISSING_TRADE_DATA",
+                        "message": "Original trade request data not found in memos",
+                    },
+                )
+                job.deliver(err_payload)
+                return
+            
+            # Find the EVALUATION memo to respond to
+            evaluation_memo = None
+            for memo in job.memos:
+                if memo.next_phase == ACPJobPhase.EVALUATION:
+                    evaluation_memo = memo
+                    break
+            
+            if not evaluation_memo:
+                print("[SELLER] ERROR: Could not find evaluation memo")
+                err_payload = IDeliverable(
+                    type="object",
+                    value={
+                        "error": "MISSING_EVALUATION_MEMO",
+                        "message": "Evaluation memo not found",
+                    },
+                )
+                job.deliver(err_payload)
+                return
+            
+            try:
+                print(f"[DEBUG] Reading from original trade memo: {original_trade_memo.content}")
+                requirements = _parse_service_requirement(original_trade_memo.content)
+                tr = TradeRequest.from_dict(requirements)
+                
+                # Resolve tokens and decimals
+                sell_addr, sell_dec = _resolve_token(tr.fromToken)
+                buy_addr, _ = _resolve_token(tr.toToken)
+                recipient = tr.recipient or env.SELLER_AGENT_WALLET_ADDRESS
+
+                # Build using Operari internal tool (KyberSwap)
+                tool = TokenTransactionTool()
+                tool_resp_raw = tool._run(
+                    buy_token=buy_addr,
+                    sell_token=sell_addr,
+                    sell_amount=str(tr.amount),
+                    wallet_address=recipient,
+                    sell_token_decimals=int(sell_dec),
+                )
+
+                # Parse tool response
+                tool_resp = json.loads(tool_resp_raw) if isinstance(tool_resp_raw, str) else tool_resp_raw
+                if "error" in tool_resp:
+                    raise RuntimeError(tool_resp.get("error"))
+
+                tx_section = tool_resp.get("transaction", {})
+                tx_data = tx_section.get("transactionData") or tx_section.get("transaction") or {}
+                needs_approval = bool(tx_section.get("needsApproval"))
+                approval_data = tx_section.get("approvalData") or {}
+
+                meta = {
+                    "quoteSource": "KyberSwap via TokenTransactionTool",
+                    "sellAmount": tx_section.get("sellAmount"),
+                    "sellToken": tx_section.get("sellToken"),
+                    "buyToken": tx_section.get("buyToken"),
+                    "gasPriceGwei": tx_data.get("gasPriceGwei"),
+                    "totalGas": tx_data.get("totalGas"),
+                    "gasUsd": tx_data.get("gasUsd"),
+                    "needsApproval": needs_approval,
+                }
+                summary = f"{tr.side.upper()} {tr.amount} {tr.fromToken} -> {tr.toToken} on {tr.chain}"
+
+                bundle = {
+                    "transactionData": tx_data,
+                }
+                if needs_approval and approval_data:
+                    bundle["approvalData"] = approval_data
+
+                delivery_data = IDeliverable(
+                    type="object",
+                    value={
+                        "quote": summary,
+                        "non_custodial_bundle": bundle,
+                        "meta": meta,
+                    },
+                )
+                print(f"[SELLER] Delivering non-custodial bundle (preview): {str(delivery_data.model_dump())[:200]}...")
+                job.deliver(delivery_data)
+                
+            except Exception as e:
+                from virtuals_acp.models import IDeliverable
+                err_payload = IDeliverable(
+                    type="object",
+                    value={
+                        "error": "QUOTE_OR_BUILD_FAILED",
+                        "message": str(e),
+                    },
+                )
+                print(f"[SELLER] Error building delivery: {e}")
+                job.deliver(err_payload)  # Now passing an IDeliverable instance
 
     if env.WHITELISTED_WALLET_PRIVATE_KEY is None:
         raise ValueError("WHITELISTED_WALLET_PRIVATE_KEY is not set")

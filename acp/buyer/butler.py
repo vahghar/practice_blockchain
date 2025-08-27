@@ -4,12 +4,13 @@ import threading
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
+from web3 import Web3
 
 # Prefer local SDK at ../acp-python over installed site-packages
-_ACPROOT = os.path.dirname(os.path.dirname(__file__))  # .../acp
-_SDK_DIR = os.path.join(os.path.dirname(_ACPROOT), "acp-python")  # sibling to acp
-if _SDK_DIR not in sys.path:
-    sys.path.insert(0, _SDK_DIR)
+#_ACPROOT = os.path.dirname(os.path.dirname(__file__))  # .../acp
+#_SDK_DIR = os.path.join(os.path.dirname(_ACPROOT), "acp-python")  # sibling to acp
+# if _SDK_DIR not in sys.path:
+#     sys.path.insert(0, _SDK_DIR)
 
 from dataclasses import replace
 from virtuals_acp import VirtualsACP, ACPJob, ACPJobPhase
@@ -132,6 +133,10 @@ def buyer():
     def on_new_task(job: ACPJob, memo_to_sign=None):
         if job.phase == ACPJobPhase.NEGOTIATION:
             for memo in job.memos:
+                print("[DEBUG][BUYER] About to pay job", job.id)
+                print(f"[DEBUG][BUYER] Payment price: {job.price}")
+                print(f"[DEBUG][BUYER] Buyer wallet: {env.BUYER_AGENT_WALLET_ADDRESS}")
+                print(f"[DEBUG][BUYER] Provider wallet: {job.provider_address if hasattr(job, 'provider_address') else 'unknown'}")
                 if memo.next_phase == ACPJobPhase.TRANSACTION:
                     print("Paying job", job.id)
                     job.pay(job.price)
@@ -180,18 +185,17 @@ def buyer():
     job_id = acp.initiate_job(
         provider_address=provider,
         service_requirement={
-            # Example: Buy 0.01 ETH worth of VIRTUAL (ETH -> VIRTUAL)
             "side": "buy",
-            "fromToken": "ETH",  # or zero address
-            "toToken": "0x6B00F08F81d81FeC5154B6E807AcD4613cD16795",  # VIRTUAL token
-            "amount": "0.00001",  # human units of fromToken
+            "fromToken": "USDC",  # or zero address
+            "toToken": "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", 
+            "amount": "0.01",  # human units of fromToken
             "slippageBps": int(os.getenv("DEFAULT_SLIPPAGE_BPS", "100")),
             "recipient": env.BUYER_AGENT_WALLET_ADDRESS,
             "chain": os.getenv("CHAIN", "base"),
             "notes": "demo request from buyer",
         },
         # Use a non-dust budget on mainnet USDC (6 decimals). Adjust if your policy expects a minimum.
-        amount=0.001,
+        amount=0.01,
         evaluator_address=env.BUYER_AGENT_WALLET_ADDRESS,
         expired_at=datetime.now() + timedelta(days=1),
     )
