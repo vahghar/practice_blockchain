@@ -6,16 +6,11 @@ from ast import literal_eval
 
 from dotenv import load_dotenv
 
-# Prefer local SDK at ../acp-python over installed site-packages
-#_ACPROOT = os.path.dirname(os.path.dirname(__file__))  # .../acp
-#_SDK_DIR = os.path.join(os.path.dirname(_ACPROOT), "acp-python")  # sibling to acp
-#if _SDK_DIR not in sys.path:
-#    sys.path.insert(0, _SDK_DIR)
-
 from dataclasses import replace
 from virtuals_acp import VirtualsACP, ACPJob, ACPJobPhase
 from virtuals_acp.env import EnvSettings
 from virtuals_acp.configs import BASE_MAINNET_CONFIG
+from virtuals_acp.models import IDeliverable
 
 
 # Make operari-server and operari-server/data importable to reuse modules
