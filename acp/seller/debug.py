@@ -2,16 +2,22 @@ import os
 import sys
 import threading
 import json
+import time
 from ast import literal_eval
 
 from dotenv import load_dotenv
+from web3 import Web3
+import secrets
 
 from dataclasses import replace
 from virtuals_acp import VirtualsACP, ACPJob, ACPJobPhase
 from virtuals_acp.env import EnvSettings
 from virtuals_acp.configs import BASE_MAINNET_CONFIG
 from virtuals_acp.models import IDeliverable
+from virtuals_acp.models import NegotiationPayload
 
+job_designated_wallets = {}  # GLOBAL storage for wallets
+job_trade_details = {}  
 
 # Make operari-server and operari-server/data importable to reuse modules
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -24,9 +30,25 @@ from acp.common.schemas import TradeRequest
 from data.crew.tools.tokenTools import TokenTransactionTool
 import csv
 
-
 load_dotenv(override=True)
 
+JOBS_DIR = "/tmp/acp_jobs"  # or use a proper data directory
+
+def save_job_data(job_id, wallet_info, trade_details):
+    """Save job data to file for monitor to read"""
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    
+    job_data = {
+        "wallet_info": wallet_info,
+        "trade_details": trade_details,
+        "status": "waiting_for_funds",
+        "created_at": time.time()
+    }
+    
+    with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
+        json.dump(job_data, f)
+    
+    print(f"[SELLER] Saved job data for {job_id}")
 
 def _parse_service_requirement(sr):
     if isinstance(sr, dict):
@@ -39,14 +61,18 @@ def _parse_service_requirement(sr):
         except Exception:
             return {}
 
-
-# Resolve token address and decimals from symbol or address.
-# Fallbacks:
-# - 'ETH' maps to Base canonical ETH address with 18 decimals
-# - If already an address (0x...), assume 18 decimals unless found in CSV
 _TOKENS_CACHE = None
 _TOKENS_CSV_PATH = os.path.join(OPERARI_ROOT, "tokens.csv")
 
+def generate_new_wallet():
+    """Generate a new Ethereum wallet for designated funds"""
+    private_key = "0x" + secrets.token_hex(32)
+    w3 = Web3()
+    account = w3.eth.account.from_key(private_key)
+    return {
+        "address": account.address,
+        "private_key": private_key
+    }
 
 def _load_tokens_csv():
     global _TOKENS_CACHE
@@ -74,10 +100,9 @@ def _load_tokens_csv():
     _TOKENS_CACHE = cache
     return _TOKENS_CACHE
 
-
 def _resolve_token(value: str):
     """
-    Returns tuple (address, decimals).
+    Returns tuple (address, decimals)
     Accepts symbol (e.g., 'USDC', 'ETH') or address (0x...).
     """
     if not value:
@@ -100,140 +125,21 @@ def _resolve_token(value: str):
     if not info:
         raise ValueError(f"Unknown token symbol '{v}'. Please use address or add to tokens.csv")
     return info.get("address"), int(info.get("decimals", 18))
-
-
 def seller():
     env = EnvSettings()
+    global job_designated_wallets
 
-    def on_new_task(job: ACPJob, memo_to_sign=None):
-        print(f"[SELLER] on_new_task: phase={job.phase} job_id={getattr(job, 'id', None)} memos={len(job.memos)}")
-        
-        if job.phase == ACPJobPhase.REQUEST:
-            print("[SELLER] REQUEST received. Checking memos for NEGOTIATION transition...")
-            for memo in job.memos:
-                if memo.next_phase == ACPJobPhase.NEGOTIATION:
-                    print("[SELLER] Accepting request -> moving to NEGOTIATION")
-                    job.respond(True)
-                    break
-        
-        elif job.phase == ACPJobPhase.TRANSACTION:
-            print("[SELLER] TRANSACTION received. Preparing quote/tx bundle and moving to EVALUATION...")
-            
-            # Find the ORIGINAL memo with trade data (not payment confirmation)
-            original_trade_memo = None
-            for memo in job.memos:
-                if memo.content and memo.content.strip().startswith('{') and 'side' in memo.content:
-                    original_trade_memo = memo
-                    break
-            
-            if not original_trade_memo:
-                print("[SELLER] ERROR: Could not find original trade request memo")
-                err_payload = IDeliverable(
-                    type="object",
-                    value={
-                        "error": "MISSING_TRADE_DATA",
-                        "message": "Original trade request data not found in memos",
-                    },
-                )
-                job.deliver(err_payload)
-                return
-            
-            # Find the EVALUATION memo to respond to
-            evaluation_memo = None
-            for memo in job.memos:
-                if memo.next_phase == ACPJobPhase.EVALUATION:
-                    evaluation_memo = memo
-                    break
-            
-            if not evaluation_memo:
-                print("[SELLER] ERROR: Could not find evaluation memo")
-                err_payload = IDeliverable(
-                    type="object",
-                    value={
-                        "error": "MISSING_EVALUATION_MEMO",
-                        "message": "Evaluation memo not found",
-                    },
-                )
-                job.deliver(err_payload)
-                return
-            
-            try:
-                print(f"[DEBUG] Reading from original trade memo: {original_trade_memo.content}")
-                requirements = _parse_service_requirement(original_trade_memo.content)
-                tr = TradeRequest.from_dict(requirements)
-                
-                # Resolve tokens and decimals
-                sell_addr, sell_dec = _resolve_token(tr.fromToken)
-                buy_addr, _ = _resolve_token(tr.toToken)
-                recipient = tr.recipient or env.SELLER_AGENT_WALLET_ADDRESS
-
-                # Build using Operari internal tool (KyberSwap)
-                tool = TokenTransactionTool()
-                tool_resp_raw = tool._run(
-                    buy_token=buy_addr,
-                    sell_token=sell_addr,
-                    sell_amount=str(tr.amount),
-                    wallet_address=recipient,
-                    sell_token_decimals=int(sell_dec),
-                )
-
-                # Parse tool response
-                tool_resp = json.loads(tool_resp_raw) if isinstance(tool_resp_raw, str) else tool_resp_raw
-                if "error" in tool_resp:
-                    raise RuntimeError(tool_resp.get("error"))
-
-                tx_section = tool_resp.get("transaction", {})
-                tx_data = tx_section.get("transactionData") or tx_section.get("transaction") or {}
-                needs_approval = bool(tx_section.get("needsApproval"))
-                approval_data = tx_section.get("approvalData") or {}
-
-                meta = {
-                    "quoteSource": "KyberSwap via TokenTransactionTool",
-                    "sellAmount": tx_section.get("sellAmount"),
-                    "sellToken": tx_section.get("sellToken"),
-                    "buyToken": tx_section.get("buyToken"),
-                    "gasPriceGwei": tx_data.get("gasPriceGwei"),
-                    "totalGas": tx_data.get("totalGas"),
-                    "gasUsd": tx_data.get("gasUsd"),
-                    "needsApproval": needs_approval,
-                }
-                summary = f"{tr.side.upper()} {tr.amount} {tr.fromToken} -> {tr.toToken} on {tr.chain}"
-
-                bundle = {
-                    "transactionData": tx_data,
-                }
-                if needs_approval and approval_data:
-                    bundle["approvalData"] = approval_data
-
-                delivery_data = IDeliverable(
-                    type="object",
-                    value={
-                        "quote": summary,
-                        "non_custodial_bundle": bundle,
-                        "meta": meta,
-                    },
-                )
-                print(f"[SELLER] Delivering non-custodial bundle (preview): {str(delivery_data.model_dump())[:200]}...")
-                job.deliver(delivery_data)
-                
-            except Exception as e:
-                from virtuals_acp.models import IDeliverable
-                err_payload = IDeliverable(
-                    type="object",
-                    value={
-                        "error": "QUOTE_OR_BUILD_FAILED",
-                        "message": str(e),
-                    },
-                )
-                print(f"[SELLER] Error building delivery: {e}")
-                job.deliver(err_payload)  # Now passing an IDeliverable instance
-
+    YOUR_TEST_WALLET = {
+        "address": os.getenv("TEST_WALLET_ADDRESS"),
+        "private_key": os.getenv("TEST_WALLET_PRIVATE_KEY")
+    }
+    # VALIDATION FIRST
     if env.WHITELISTED_WALLET_PRIVATE_KEY is None:
         raise ValueError("WHITELISTED_WALLET_PRIVATE_KEY is not set")
     if env.SELLER_ENTITY_ID is None:
         raise ValueError("SELLER_ENTITY_ID is not set")
 
-    # Allow overriding the RPC via .env without touching SDK
+    # Config definition (ONCE)
     rpc_override = os.getenv("BASE_MAINNET_RPC_URL")
     config = replace(BASE_MAINNET_CONFIG, rpc_url=rpc_override) if rpc_override else BASE_MAINNET_CONFIG
 
@@ -244,7 +150,152 @@ def seller():
     })
     print("[SELLER] Agent:", env.SELLER_AGENT_WALLET_ADDRESS, "Entity:", env.SELLER_ENTITY_ID)
 
-    VirtualsACP(
+    '''def on_new_task(job: ACPJob, memo_to_sign=None):
+        print(f"[SELLER] on_new_task: phase={job.phase} job_id={getattr(job, 'id', None)} memos={len(job.memos)}")
+        
+        global job_designated_wallets, job_trade_details
+        
+        if job.phase == ACPJobPhase.REQUEST:
+            print("[SELLER] REQUEST received. Checking memos for NEGOTIATION transition...")
+            for memo in job.memos:
+                if memo.next_phase == ACPJobPhase.NEGOTIATION:
+                    designated_wallet = YOUR_TEST_WALLET
+                    print(f"[SELLER] Generated designated wallet: {designated_wallet['address']}")
+                    
+                    job_designated_wallets[job.id] = designated_wallet
+                    
+                    job.respond(
+                        accept=True,
+                        payload={"walletAddress": designated_wallet['address']},  # ✅ Correct way
+                        reason="Ready to process trade"
+                    )
+                    break
+        
+        elif job.phase == ACPJobPhase.TRANSACTION:
+            print("[SELLER] TRANSACTION received. Preparing funds request...")
+            
+            original_trade_memo = None
+            for memo in job.memos:
+                if memo.content and memo.content.strip().startswith('{') and 'side' in memo.content:
+                    original_trade_memo = memo
+                    break
+            
+            if not original_trade_memo:
+                print("[SELLER] ERROR: Could not find original trade request memo")
+                return
+            
+            try:
+                requirements = _parse_service_requirement(original_trade_memo.content)
+                tr = TradeRequest.from_dict(requirements)
+
+                # FIX: Get the wallet from storage instead of recreating it
+                designated_wallet = job_designated_wallets.get(job.id)
+                if not designated_wallet:
+                    print(f"[SELLER] ERROR: No designated wallet found for job {job.id}")
+                    return
+
+                # Store trade details
+                trade_details = {
+                    'fromToken': tr.fromToken,
+                    'toToken': tr.toToken, 
+                    'amount': tr.amount,
+                    'sell_decimals': 6
+                }
+                
+                job_trade_details[job.id] = trade_details
+                
+                # FIXED: Save to file for monitor to read
+                save_job_data(job.id, designated_wallet, trade_details)
+                print(f"[SELLER] Registered trade details for job {job.id}")
+                
+                # Use the GLOBAL acp_instance
+                global acp_instance
+                acp_instance.requestFunds(
+                    jobId=job.id,
+                    amount=float(tr.amount),
+                    reason=f"Funds needed for {tr.fromToken}->{tr.toToken} swap",
+                    nextPhase=ACPJobPhase.TRANSACTION
+                )
+                
+            except Exception as e:
+                print(f"[SELLER] Error in funds request: {e}")
+    '''
+
+    def on_new_task(job: ACPJob, memo_to_sign=None):
+    print(f"[SELLER] on_new_task: phase={job.phase} job_id={getattr(job, 'id', None)} memos={len(job.memos)}")
+    
+    global job_designated_wallets, job_trade_details
+    
+    if job.phase == ACPJobPhase.REQUEST:
+        print("[SELLER] REQUEST received. Checking memos for NEGOTIATION transition...")
+        for memo in job.memos:
+            if memo.next_phase == ACPJobPhase.NEGOTIATION:
+                designated_wallet = YOUR_TEST_WALLET
+                print(f"[SELLER] Generated designated wallet: {designated_wallet['address']}")
+                
+                job_designated_wallets[job.id] = designated_wallet
+                
+                # Create proper NegotiationPayload with wallet address
+                payload = NegotiationPayload(
+                    service_requirement={"walletAddress": designated_wallet['address']}
+                )
+                
+                job.respond(
+                    accept=True,
+                    payload=payload,
+                    reason="Ready to process trade"
+                )
+                break
+    
+    elif job.phase == ACPJobPhase.TRANSACTION:
+        print("[SELLER] TRANSACTION received. Preparing funds request...")
+        
+        original_trade_memo = None
+        for memo in job.memos:
+            if memo.content and memo.content.strip().startswith('{') and 'side' in memo.content:
+                original_trade_memo = memo
+                break
+        
+        if not original_trade_memo:
+            print("[SELLER] ERROR: Could not find original trade request memo")
+            return
+        
+        try:
+            requirements = _parse_service_requirement(original_trade_memo.content)
+            tr = TradeRequest.from_dict(requirements)
+
+            designated_wallet = job_designated_wallets.get(job.id)
+            if not designated_wallet:
+                print(f"[SELLER] ERROR: No designated wallet found for job {job.id}")
+                return
+
+            trade_details = {
+                'fromToken': tr.fromToken,
+                'toToken': tr.toToken, 
+                'amount': tr.amount,
+                'sell_decimals': 6
+            }
+            
+            job_trade_details[job.id] = trade_details
+            
+            save_job_data(job.id, designated_wallet, trade_details)
+            print(f"[SELLER] Registered trade details for job {job.id}")
+            
+            global acp_instance
+            acp_instance.requestFunds(
+                jobId=job.id,
+                amount=float(tr.amount),
+                reason=f"Funds needed for {tr.fromToken}->{tr.toToken} swap",
+                nextPhase=ACPJobPhase.TRANSACTION
+            )
+            
+        except Exception as e:
+            print(f"[SELLER] Error in funds request: {e}")
+
+
+    # Create VirtualsACP instance ONCE
+    global acp_instance
+    acp_instance = VirtualsACP(
         wallet_private_key=env.WHITELISTED_WALLET_PRIVATE_KEY,
         agent_wallet_address=env.SELLER_AGENT_WALLET_ADDRESS,
         on_new_task=on_new_task,
@@ -254,7 +305,6 @@ def seller():
 
     print("Waiting for new task...")
     threading.Event().wait()
-
 
 if __name__ == "__main__":
     seller()

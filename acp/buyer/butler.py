@@ -214,7 +214,7 @@ def check_balance_and_allowance(env, token_address, spender_address, required_am
 
 def buyer():
     env = EnvSettings()
-
+    '''
     def on_new_task(job: ACPJob, memo_to_sign=None):
         if job.phase == ACPJobPhase.NEGOTIATION:
             for memo in job.memos:
@@ -291,7 +291,54 @@ def buyer():
             print("Job completed", job)
         elif job.phase == ACPJobPhase.REJECTED:
             print("Job rejected", job)
+    '''
 
+    def on_new_task(job: ACPJob, memo_to_sign=None):
+        if job.phase == ACPJobPhase.NEGOTIATION:
+            # Your existing payment logic here...
+            pass
+            
+        elif job.phase == ACPJobPhase.TRANSACTION:
+            print("\n[BUYER] TRANSACTION phase - checking for funds requests")
+            
+            # Look for funds request memos
+            for memo in job.memos:
+                if hasattr(memo, 'type') and getattr(memo.type, 'value', None) == 3:  # FUNDS_REQUEST type
+                    print(f"[BUYER] Funds request found: {memo.amount} {memo.reason}")
+                    
+                    # Get the designated wallet from job response
+                    designated_wallet = None
+                    for prev_memo in job.memos:
+                        if hasattr(prev_memo, 'walletAddress') and prev_memo.walletAddress:
+                            designated_wallet = prev_memo.walletAddress
+                            break
+                    
+                    if not designated_wallet:
+                        print("[BUYER] ERROR: No designated wallet found in job memos")
+                        return
+                    
+                    # Transfer funds to designated wallet
+                    print(f"[BUYER] Transferring {memo.amount} to designated wallet: {designated_wallet}")
+                    
+                    try:
+                        tx_hash = acp.transferFunds(
+                            jobId=job.id,
+                            amount=float(memo.amount),
+                            recipient=designated_wallet,
+                            reason=memo.reason,
+                            nextPhase=ACPJobPhase.TRANSACTION
+                        )
+                        
+                        if tx_hash:
+                            print(f"[SUCCESS] Funds transferred: {tx_hash}")
+                        else:
+                            print("[ERROR] Failed to transfer funds")
+                            
+                    except Exception as e:
+                        print(f"[ERROR] Transfer failed: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                    break
 
     '''def on_evaluate(job: ACPJob):
         print("Evaluation function called", job.memos)
